@@ -35,7 +35,7 @@ from .lsda import LSDAExceptionTable
 from .metaelf import MetaELF, maybedecode
 from .regions import ELFSection, ELFSegment
 from .relocation import get_relocation
-from .relocation.generic import MipsGlobalReloc, MipsLocalReloc
+from .relocation.generic import MipsGlobalReloc, MipsLocalReloc, GenericRelativeReloc
 from .subprogram import LexicalBlock, Subprogram
 from .symbol import ELFSymbol, Symbol, SymbolType
 from .variable import Variable
@@ -561,9 +561,9 @@ class ELF(MetaELF):
 
         self.memory.add_backer(AT.from_lva(mapstart, self).to_rva(), data, overwrite=True)
 
-    def _make_reloc(self, readelf_reloc, symbol, dest_section: ELFSection | None = None):
+    def _make_reloc(self, readelf_reloc, symbol, dest_section: ELFSection | None = None, relr=False):
         addend = readelf_reloc.entry.r_addend if readelf_reloc.is_RELA() else None
-        RelocClass = get_relocation(self.arch.name, readelf_reloc.entry.r_info_type)
+        RelocClass = get_relocation(self.arch.name, readelf_reloc.entry.r_info_type) if not relr else GenericRelativeReloc
         if RelocClass is None:
             return None
 
@@ -1103,6 +1103,27 @@ class ELF(MetaELF):
                 readelf_relocsec.elffile = None
                 self.__register_relocs(readelf_relocsec, dynsym)
 
+            # try to parse relocations out of a table of type DT_RELR
+            if "DT_RELR" in self._dynamic:
+                relroffset = AT.from_lva(self._dynamic["DT_RELR"], self).to_rva()
+                if "DT_RELRSZ" not in self._dynamic:
+                    raise CLEInvalidBinaryError(f"Dynamic section contains DT_RELR but not DT_RELRSZ")
+                relrsz = self._dynamic["DT_RELRSZ"]
+                fakerelrheader = {
+                    "sh_offset": relroffset,
+                    "sh_type": "SHT_RELR",
+                    "sh_entsize": self._reader.structs.Elf_Relr.sizeof(),
+                    "sh_size": relrsz,
+                    "sh_flags": 0,
+                    "sh_addralign": 0,
+                }
+                readelf_relrsec = elffile.RelrRelocationSection(fakerelrheader, "relr_cle", self._reader)
+                # support multiple versions of pyelftools
+                readelf_relrsec.stream = self.memory
+                readelf_relrsec._stream = self.memory
+                readelf_relrsec.elffile = None
+                self.__register_relocs(readelf_relrsec, dynsym)
+
             # try to parse relocations out of a table of type DT_JMPREL
             if "DT_JMPREL" in self._dynamic:
                 jmpreloffset = AT.from_lva(self._dynamic["DT_JMPREL"], self).to_rva()
@@ -1213,10 +1234,13 @@ class ELF(MetaELF):
                         relocs.append(reloc)
                         self.relocs.append(reloc)
             else:
-                symbol = self.get_symbol(readelf_reloc.entry.r_info_sym, symtab)
+                relr = section.header["sh_type"] == "SHT_RELR"
+                r_info_sym = readelf_reloc.entry.r_info_sym if not relr else 0
+
+                symbol = self.get_symbol(r_info_sym, symtab)
                 if symbol is None:
                     continue
-                reloc = self._make_reloc(readelf_reloc, symbol, dest_sec)
+                reloc = self._make_reloc(readelf_reloc, symbol, dest_sec, relr)
                 if reloc is not None:
                     relocs.append(reloc)
                     self.relocs.append(reloc)
@@ -1319,7 +1343,7 @@ class ELF(MetaELF):
             if isinstance(sec_readelf, sections.SymbolTableSection):
                 self.__register_section_symbols(sec_readelf)
             if isinstance(sec_readelf, RelocationSection) and not (
-                "DT_REL" in self._dynamic or "DT_RELA" in self._dynamic or "DT_JMPREL" in self._dynamic
+                "DT_REL" in self._dynamic or "DT_RELA" in self._dynamic or "DT_RELR" in self._dynamic or "DT_JMPREL" in self._dynamic
             ):
                 self.__register_relocs(sec_readelf, dynsym=None)
 
